@@ -12,6 +12,7 @@ use Marko\Filesystem\Contracts\DirectoryListingInterface;
 use Marko\Filesystem\Contracts\FilesystemInterface;
 use Marko\Filesystem\Exceptions\FileNotFoundException;
 use Marko\Filesystem\Exceptions\FilesystemException;
+use Marko\Filesystem\Exceptions\PathException;
 use Marko\Filesystem\S3\Config\S3Config;
 use Marko\Filesystem\Values\DirectoryEntry;
 use Marko\Filesystem\Values\DirectoryListing;
@@ -68,6 +69,11 @@ readonly class S3Filesystem implements FilesystemInterface
         'yml' => 'text/yaml',
         'md' => 'text/markdown',
     ];
+
+    /**
+     * Maximum lifetime of a SigV4 pre-signed URL (7 days).
+     */
+    private const int MAX_TEMPORARY_URL_EXPIRATION = 604800;
 
     public function __construct(
         private S3Client $client,
@@ -356,7 +362,7 @@ readonly class S3Filesystem implements FilesystemInterface
             $this->client->copyObject([
                 'Bucket' => $this->config->bucket,
                 'Key' => $this->prefixPath($destination),
-                'CopySource' => $this->config->bucket . '/' . $this->prefixPath($source),
+                'CopySource' => $this->copySource($source),
             ]);
 
             return true;
@@ -681,11 +687,21 @@ readonly class S3Filesystem implements FilesystemInterface
 
     /**
      * Generate a temporary (pre-signed) URL for the given path.
+     *
+     * @throws FilesystemException When the expiration is outside 1..604800 seconds (the SigV4 limit)
      */
     public function temporaryUrl(
         string $path,
         int $expiration = 3600,
     ): string {
+        if ($expiration < 1 || $expiration > self::MAX_TEMPORARY_URL_EXPIRATION) {
+            throw new FilesystemException(
+                message: "Invalid temporary URL expiration: $expiration seconds",
+                context: 'S3 pre-signed URLs must expire between 1 and ' . self::MAX_TEMPORARY_URL_EXPIRATION . ' seconds (7 days)',
+                suggestion: 'Pass an expiration of at least 1 second and no more than ' . self::MAX_TEMPORARY_URL_EXPIRATION . ' seconds',
+            );
+        }
+
         $command = $this->client->getCommand('GetObject', [
             'Bucket' => $this->config->bucket,
             'Key' => $this->prefixPath($path),
@@ -699,9 +715,29 @@ readonly class S3Filesystem implements FilesystemInterface
         return (string) $request->getUri();
     }
 
+    /**
+     * Build the bucket-qualified CopySource, URL-encoding each key segment so
+     * characters such as `?`, `#`, `+` and spaces stay part of the key instead
+     * of becoming a query string (e.g. `?versionId=`) or breaking the request.
+     *
+     * @throws PathException
+     */
+    private function copySource(
+        string $source,
+    ): string {
+        $segments = array_map(rawurlencode(...), explode('/', $this->prefixPath($source)));
+
+        return $this->config->bucket . '/' . implode('/', $segments);
+    }
+
+    /**
+     * @throws PathException
+     */
     private function prefixPath(
         string $path,
     ): string {
+        $this->validatePath($path);
+
         $normalized = ltrim($path, '/');
 
         if ($this->config->prefix === '') {
@@ -709,6 +745,33 @@ readonly class S3Filesystem implements FilesystemInterface
         }
 
         return $this->config->prefix . '/' . $normalized;
+    }
+
+    /**
+     * Reject paths that could escape the configured prefix. S3 itself stores
+     * `..` literally, but S3-compatible gateways and proxies may resolve
+     * dot-segments or treat backslashes as separators, breaking prefix
+     * isolation.
+     *
+     * @throws PathException
+     */
+    private function validatePath(
+        string $path,
+    ): void {
+        if (str_contains($path, "\0")) {
+            throw PathException::invalidPath($path, 'Path contains a NUL byte');
+        }
+
+        if (str_contains($path, '\\')) {
+            throw PathException::invalidPath(
+                $path,
+                'Path contains a backslash, which some S3-compatible services treat as a directory separator',
+            );
+        }
+
+        if (in_array('..', explode('/', $path), true)) {
+            throw PathException::traversalAttempt($path);
+        }
     }
 
     private function stripPrefix(
